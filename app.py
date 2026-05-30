@@ -11,8 +11,18 @@ st.set_page_config(page_title="BLK Dashboarding", layout="wide")
 
 def load_csv(file):
     if file is not None:
-        # Polars can read CSVs very efficiently
-        return pl.read_csv(file)
+        # Lista estendida de códigos de erro e valores nulos comuns
+        bad_vals = ["ERR", "without_value", "outside", "N/A", "null", "nan", "none", "", " "]
+        
+        # O Polars é extremamente rápido, mas precisa de ajuda para detectar tipos
+        # em arquivos muito "sujos" ou muito grandes.
+        return pl.read_csv(
+            file,
+            infer_schema_length=50000,  # Aumentado para 50k para maior precisão
+            null_values=bad_vals,
+            ignore_errors=True,         # Ignora linhas malformadas ou erros de tipo pontuais
+            truncate_ragged_lines=True  # Lida com arquivos que tenham número de colunas variável
+        )
     return None
 
 def format_number(val):
@@ -47,6 +57,11 @@ st.warning("⚠️ Suporte a arquivos de até 10GB ativado. Certifique-se de que
 # Sidebar for Uploads and Config
 with st.sidebar:
     st.header("📁 Upload de Dados")
+    
+    # Debug para conferir o limite configurado
+    limit = st.get_option("server.maxUploadSize")
+    st.caption(f"Limite atual do uploader: {limit} MB")
+    
     uploaded_blocks = st.file_uploader("Subir Modelo de Blocos (CSV)", type="csv")
     uploaded_db = st.file_uploader("Subir Banco de Dados (Opcional) (CSV)", type="csv")
     
@@ -60,25 +75,52 @@ with st.sidebar:
 
     if st.session_state.df_blocks is not None:
         df = st.session_state.df_blocks
-        st.header("⚙️ Mapeamento de Variáveis")
-        cols = df.columns
-        num_cols = [c for c, t in zip(df.columns, df.dtypes) if t in [pl.Int64, pl.Float64, pl.Int32, pl.Float32]]
         
-        st.session_state.mapping['tonnage_vol'] = st.selectbox("Variável de Tonelagem/Volume", num_cols)
+        # Limpeza agressiva: Tenta converter colunas que parecem numéricas, 
+        # transformando qualquer texto restante em nulo.
+        cols = df.columns
+        
+        # Identificamos colunas que são puramente numéricas ou que o Polars 
+        # achou que era string mas podem ser números sujos.
+        potential_nums = [c for c, t in zip(df.columns, df.dtypes) if t in [pl.Int64, pl.Float64, pl.Int32, pl.Float32, pl.String]]
+
+        st.header("⚙️ Mapeamento de Variáveis")
+        
+        mapping_ton = st.selectbox("Variável de Tonelagem/Volume", potential_nums, key="ton_sel")
+        st.session_state.mapping['tonnage_vol'] = mapping_ton
         st.session_state.mapping['is_tonnage'] = st.radio("Tipo", ["Tonelagem", "Volume"])
         
-        st.session_state.mapping['grades'] = st.multiselect("Variáveis de Teores", [c for c in num_cols if c != st.session_state.mapping['tonnage_vol']])
+        mapping_grades = st.multiselect("Variáveis de Teores", [c for c in potential_nums if c != mapping_ton], key="grade_sel")
+        st.session_state.mapping['grades'] = mapping_grades
+        
+        # FORÇAMOS A LIMPEZA DAS SELECIONADAS:
+        # Transformamos qualquer texto que sobrou em null e garantimos que são Float64
+        selected_numeric_cols = [mapping_ton] + mapping_grades
+        for c in selected_numeric_cols:
+            if df[c].dtype == pl.String:
+                df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False))
+        
+        st.session_state.df_blocks = df # Atualizamos o dataframe limpo
         
         grade_units = {}
-        for g in st.session_state.mapping['grades']:
+        for g in mapping_grades:
             grade_units[g] = st.text_input(f"Unidade para {g}", "pct", key=f"unit_{g}")
         st.session_state.mapping['grade_units'] = grade_units
 
         st.session_state.mapping['categories'] = st.multiselect("Variáveis de Categoria (Lito/Recurso)", cols, key="cat_sel")
         
-        st.session_state.mapping['fractions'] = st.multiselect("Variáveis de Fracionamento (g1, g2...)", num_cols)
+        mapping_fracs = st.multiselect("Variáveis de Fracionamento (g1, g2...)", potential_nums, key="frac_sel")
+        st.session_state.mapping['fractions'] = mapping_fracs
+        for c in mapping_fracs:
+            if df[c].dtype == pl.String:
+                df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False))
         
-        st.session_state.mapping['density'] = st.selectbox("Variável de Densidade (Opcional)", ["Nenhuma"] + num_cols)
+        mapping_dens = st.selectbox("Variável de Densidade (Opcional)", ["Nenhuma"] + potential_nums, key="dens_sel")
+        st.session_state.mapping['density'] = mapping_dens
+        if mapping_dens != "Nenhuma" and df[mapping_dens].dtype == pl.String:
+            df = df.with_columns(pl.col(mapping_dens).cast(pl.Float64, strict=False))
+
+        st.session_state.df_blocks = df
 
         st.header("🎨 Cores")
         color_json = st.text_area("Dicionário de Cores (JSON)", "{}")
@@ -133,12 +175,13 @@ if st.session_state.df_blocks is not None:
             # Tabela de Percentuais
             if mapping.get('grades'):
                 st.subheader("Percentual de Blocos com Valor por Categoria")
-                total_counts = df.group_by(mapping['categories']).count().rename({"count": "total"})
+                total_counts = df.group_by(mapping['categories']).len().rename({"len": "total"})
                 
                 final_pct = total_counts
                 for grade in mapping['grades']:
                     grade_count = df.group_by(mapping['categories']).agg(pl.col(grade).count().alias(grade))
-                    final_pct = final_pct.join(grade_count, on=mapping['categories'], how="left")
+                    # Usamos coalesce=True para evitar duplicação de colunas de categoria
+                    final_pct = final_pct.join(grade_count, on=mapping['categories'], how="full", coalesce=True)
                     final_pct = final_pct.with_columns((pl.col(grade) / pl.col("total") * 100).alias(grade))
                 
                 final_pct = final_pct.drop("total")
@@ -197,14 +240,14 @@ if st.session_state.df_blocks is not None:
                 st.subheader("Teores Negativos")
                 neg_data = []
                 for grade in mapping['grades']:
-                    neg_counts = df.filter(pl.col(grade) < 0).group_by(mapping['categories']).count().rename({"count": f"{grade}_negativos"})
+                    neg_counts = df.filter(pl.col(grade) < 0).group_by(mapping['categories']).len().rename({"len": f"{grade}_negativos"})
                     if not neg_counts.is_empty():
                         neg_data.append(neg_counts)
                 if neg_data:
                     # Join negative data
                     res_neg = neg_data[0]
                     for d in neg_data[1:]:
-                        res_neg = res_neg.join(d, on=mapping['categories'], how="outer")
+                        res_neg = res_neg.join(d, on=mapping['categories'], how="full", coalesce=True)
                     st.table(res_neg.to_pandas())
                     get_table_download_link(res_neg, "teores_negativos.csv")
                 else:
@@ -287,7 +330,7 @@ if st.session_state.df_blocks is not None:
                         yaxis2=dict(title="Teor Médio", overlaying='y', side='right'),
                         title=f"Curva Teor-Tonelagem para {selected_grade}"
                     )
-                    st.plotly_chart(fig_curve, use_container_width=True)
+                    st.plotly_chart(fig_curve, width='stretch')
 
             # Histograma
             st.subheader("Histograma Interativo")
@@ -305,7 +348,7 @@ if st.session_state.df_blocks is not None:
                 
             fig_hist = px.histogram(filtered_hist, x=hist_grade, color=mapping['categories'][0], 
                                    marginal="box", color_discrete_map=st.session_state.color_dict)
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width='stretch')
 
 else:
     st.info("Por favor, carregue um arquivo CSV de modelo de blocos para começar.")
