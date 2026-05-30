@@ -41,7 +41,8 @@ if 'mapping' not in st.session_state:
 if 'color_dict' not in st.session_state:
     st.session_state.color_dict = {}
 
-st.title("📊 BLK Dashboarding (Polars Engine)")
+st.title("📊 BLK Dashboarding (Polars 10GB Optimized)")
+st.warning("⚠️ Suporte a arquivos de até 10GB ativado. Certifique-se de que seu sistema possui RAM suficiente (recomenda-se 32GB+ para processamento fluido local).")
 
 # Sidebar for Uploads and Config
 with st.sidebar:
